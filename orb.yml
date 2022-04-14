@@ -1,0 +1,176 @@
+version: 2.1
+
+description: First-aid kit for performance-related issues on Windows
+
+display:
+  home_url: "https://makotom.org/"
+  source_url: "https://github.com/circle-makotom-orbs/windows-performance-diagnosis"
+
+commands:
+  # https://social.technet.microsoft.com/Forums/office/ja-JP/f83b6e6c-7188-4cfa-bca1-54c375c21499/12497125011245712540125101253112473
+  start-perflog:
+    parameters:
+      output-dir:
+        description: The name of the folder where performance logs will be saved
+        type: string
+        default: 'C:\Circle-Perf-Triage'
+      collector-name:
+        description: The name of the data collector set
+        type: string
+        default: Circle-Perf-Triage
+    steps:
+      - run:
+          name: Create a data collector set
+          shell: powershell.exe
+          command: |
+            logman create counter $env:COLLECTOR_NAME -c "\Cache\*" "\LogicalDisk(*)\*" "\Memory\*" "\Network Adapter(*)\*" "\Network Interface(*)\*" "\PhysicalDisk(*)\*" "\Process(*)\*" "\Processor(*)\*" "\Processor Information(*)\*" "\Server\*" "\System\*" "\Paging File(*)\*" "\Database(*)\*" "\Server Work Queues(*)\*" "\Objects\*" -si 00:00:01 -v NNNNNN -o "${env:OUTPUT_DIR}\Circle-Perf-Triage"
+          environment:
+            OUTPUT_DIR: << parameters.output-dir >>
+            COLLECTOR_NAME: << parameters.collector-name >>
+      - run:
+          name: Start performance counters
+          shell: powershell.exe
+          command: logman start $env:COLLECTOR_NAME
+          environment:
+            COLLECTOR_NAME: << parameters.collector-name >>
+
+  stop-and-save-perflog:
+    parameters:
+      output-dir:
+        description: The name of the folder where performance logs will be saved
+        type: string
+        default: 'C:\Circle-Perf-Triage'
+      collector-name:
+        description: The name of the data collector set
+        type: string
+        default: Circle-Perf-Triage
+    steps:
+      - run:
+          name: Stop performance counters
+          when: always
+          shell: powershell.exe
+          command: logman stop $env:COLLECTOR_NAME
+          environment:
+            COLLECTOR_NAME: << parameters.collector-name >>
+      - store_artifacts:
+          path: << parameters.output-dir >>
+
+  record-wpr-in-background:
+    parameters:
+      for-sec:
+        description: The total duration for WPR recording in seconds
+        type: integer
+      cue-sec:
+        description: The cue time in seconds before actually starting WPR recording
+        type: integer
+        default: 10
+      split-by-sec:
+        description: Duration for a single WPR recording - make sure that this value is not too large, or otherwise the resulting ETL file would become too fat to analyse.
+        type: integer
+        default: 60
+      output-dir:
+        description: The name of the folder where ETL files are created
+        type: string
+        default: 'C:\Circle-WPR'
+      start-command:
+        description: Start commands for WPR - to specify non-general profiles
+        type: string
+        default: -start GeneralProfile
+    steps:
+      - run:
+          name: Record WPR for << parameters.for-sec >> second(s) after << parameters.cue-sec >>-second cue
+          background: true
+          shell: powershell.exe
+          command: |
+            $ErrorActionPreference = "Stop"
+
+            Start-Sleep << parameters.cue-sec >>
+
+            [void](New-Item -Path $env:OUTPUT_DIR -ItemType Directory -Force)
+            for (($StartDateTime = Get-Date), ($iter = 0); (New-TimeSpan -Start $StartDateTime -End (Get-Date)).TotalSeconds -lt << parameters.for-sec >>; $iter += 1) {
+                Write-Host "Iteration ${iter}"
+                wpr << parameters.start-command >>
+                Start-Sleep << parameters.split-by-sec >>
+                wpr -stop "${env:OUTPUT_DIR}\wpr-${iter}.etl"
+            }
+          environment:
+            OUTPUT_DIR: << parameters.output-dir >>
+            # Durations are asserted to be integer and are safe to be injected directly into the PS code
+
+  ensure-and-save-wpr:
+    parameters:
+      output-dir:
+        description: The name of the folder where ETL files are created
+        type: string
+        default: 'C:\Circle-WPR'
+    steps:
+      - run:
+          when: always
+          name: Stop ongoing WRP recording
+          shell: powershell.exe
+          command: |
+            if (wpr -status | Select-String "WPR recording is in progress...") {
+                wpr -stop "${env:OUTPUT_DIR}\wpr-x.etl"
+            }
+          environment:
+            OUTPUT_DIR: << parameters.output-dir >>
+      - run:
+          when: always
+          name: Create a Zip file with PDBs
+          shell: powershell.exe
+          command: |
+            $ProgressPreference = "SilentlyContinue"
+            Compress-Archive $env:OUTPUT_DIR "${env:OUTPUT_DIR}.zip"
+          environment:
+            OUTPUT_DIR: << parameters.output-dir >>
+      - store_artifacts:
+          path: << parameters.output-dir >>.zip
+
+examples:
+  basic-usage:
+    description: Basic usage
+    usage:
+      version: 2.1
+
+      orbs:
+        win-perf-diag: circle-makotom-orbs/windows-performance-diagnosis@volatile
+
+      jobs:
+        build:
+          machine:
+            image: windows-server-2019-vs2019:stable
+          resource_class: windows.large
+          steps:
+            - checkout
+
+            # Start recording
+            - win-perf-diag/start-perflog
+            - win-perf-diag/record-wpr-in-background:
+                for-sec: 100
+                split-by-sec: 30
+
+            # This is the part to be diagnosed
+            - run:
+                name: Do something for 120 seconds
+                shell: powershell.exe
+                command: |
+                  $ErrorActionPreference = "Stop"
+
+                  Write-Host "Starting..."
+
+                  $procs = @()
+                  foreach ($iter in 0..4) {
+                      $procs += Start-Process -PassThru powershell.exe -ArgumentList "-Command", '"while ($true) {}"'
+                  }
+
+                  Start-Sleep 120
+
+                  foreach ($proc in $procs) {
+                      Stop-Process $proc
+                  }
+
+                  Write-Host "DONE."
+
+            # Stop recording and save records
+            - win-perf-diag/ensure-and-save-wpr
+            - win-perf-diag/stop-and-save-perflog
